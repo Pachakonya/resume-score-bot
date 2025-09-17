@@ -4,7 +4,7 @@ ResumeScoreBot helps users quickly evaluate how well their resume matches a job 
 
 ## 🎥 Demo
 
-[![Watch the video](https://youtu.be/HzyJTzH7mRU/0.jpg)](https://youtu.be/HzyJTzH7mRU)  
+[![Watch the video](https://img.youtube.com/vi/HzyJTzH7mRU/maxresdefault.jpg)](https://youtu.be/HzyJTzH7mRU)  
 *Click the thumbnail to watch the demo.*
 
 
