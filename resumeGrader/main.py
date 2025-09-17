@@ -18,12 +18,76 @@ import requests
 from bs4 import BeautifulSoup
 import PyPDF2
 import openai
+import numpy as np
+from typing import List, Tuple
 
 # ---------- CONFIG ----------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai.api_key = OPENAI_API_KEY
+
+# ---------- RAG / KB STORAGE ----------
+KB_PATH = os.path.join(os.path.dirname(__file__), "kb_store.json")
+
+def _load_kb() -> dict:
+    if not os.path.exists(KB_PATH):
+        return {"vectors": [], "chunks": [], "sources": []}
+    try:
+        with open(KB_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"vectors": [], "chunks": [], "sources": []}
+
+def _save_kb(kb: dict) -> None:
+    with open(KB_PATH, "w") as f:
+        json.dump(kb, f)
+
+def _chunk_text(text: str, chunk_size: int = 1200, overlap: int = 150) -> List[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    chunks: List[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        chunks.append(text[start:end])
+        if end == len(text):
+            break
+        start = end - overlap
+        if start < 0:
+            start = 0
+    return chunks
+
+def _embed_texts(texts: List[str]) -> List[List[float]]:
+    if not texts:
+        return []
+    resp = openai.Embedding.create(model="text-embedding-3-small", input=texts)
+    vectors = [d["embedding"] for d in resp["data"]]
+    return vectors
+
+def add_document_to_kb(text: str, source: str) -> Tuple[int, int]:
+    """Add a document to KB. Returns (num_chunks, total_vectors)."""
+    kb = _load_kb()
+    chunks = _chunk_text(text)
+    vectors = _embed_texts(chunks)
+    kb["chunks"].extend(chunks)
+    kb["vectors"].extend(vectors)
+    kb["sources"].extend([source] * len(chunks))
+    _save_kb(kb)
+    return len(chunks), len(kb["vectors"])
+
+def retrieve_chunks(query: str, top_k: int = 5) -> List[str]:
+    kb = _load_kb()
+    if not kb["vectors"]:
+        return []
+    q_vec = _embed_texts([query])[0]
+    vecs = np.array(kb["vectors"], dtype=np.float32)
+    q = np.array(q_vec, dtype=np.float32)
+    # cosine similarity
+    vecs_norm = vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-8)
+    q_norm = q / (np.linalg.norm(q) + 1e-8)
+    sims = vecs_norm.dot(q_norm)
+    idxs = sims.argsort()[-top_k:][::-1]
+    return [kb["chunks"][int(i)] for i in idxs]
 
 # ---------- LOGGING ----------
 logging.basicConfig(
@@ -186,6 +250,16 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ *Could not extract text from the PDF.* Try a different file.", parse_mode=ParseMode.MARKDOWN)
             return
 
+        # If user is in KB add mode, add to knowledge base instead of treating as main resume
+        if context.user_data.get("kb_mode"):
+            num_chunks, total = add_document_to_kb(resume_text, source=doc.file_name)
+            await update.message.reply_text(
+                f"🧠 *Added to knowledge base:* `{doc.file_name}`\n"
+                f"Chunks: {num_chunks} • Total KB vectors: {total}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
         context.user_data["resume_text"] = resume_text
         context.user_data["resume_file_path"] = file_path
 
@@ -213,7 +287,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🆕 Save job description so buttons can reuse it
     context.user_data["last_job_desc"] = user_message
 
-    # Use OpenAI to score the resume vs job description
+    # Retrieve relevant context from KB (RAG)
+    kb_context_chunks = retrieve_chunks(user_message, top_k=5)
+    kb_context = "\n\n".join(kb_context_chunks) if kb_context_chunks else ""
+
+    # Use OpenAI to score the resume vs job description, augmented with KB context
     prompt = f"""
     You are an ATS (Applicant Tracking System) assistant.
     Compare the following resume to the job description.
@@ -241,6 +319,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     Job Description:
     {user_message}
+
+    Extra context from similar resumes (may help identify relevant skills):
+    {kb_context}
     """
 
     try:
@@ -285,7 +366,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "rerun":
         await query.edit_message_text("🔄 *Re-running ATS check...*", parse_mode=ParseMode.MARKDOWN)
-        # Reuse the same structured prompt as in handle_text
+        # Reuse the same structured prompt as in handle_text, with KB context
+        kb_context_chunks = retrieve_chunks(last_job_desc, top_k=5)
+        kb_context = "\n\n".join(kb_context_chunks) if kb_context_chunks else ""
         prompt = f"""
         You are an ATS (Applicant Tracking System) assistant.
         Compare the following resume to the job description.
@@ -313,6 +396,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         Job Description:
         {last_job_desc}
+
+        Extra context from similar resumes (may help identify relevant skills):
+        {kb_context}
         """
         try:
             response = openai.ChatCompletion.create(
@@ -439,7 +525,33 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3) 🔗 Send the job description text or job posting link\n\n"
         "*Commands*:\n"
         "• /start – start\n"
-        "• /help – this message\n",
+        "• /help – this message\n"
+        "• /kb_add – add PDFs to knowledge base (RAG)\n"
+        "• /kb_clear – clear the knowledge base\n"
+        "• /done – finish KB upload mode\n",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ---------- KB COMMANDS ----------
+async def kb_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["kb_mode"] = True
+    await update.message.reply_text(
+        "🧠 *Knowledge Base mode enabled.*\n"
+        "Send one or more PDF resumes to add. When finished, send /done.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def kb_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _save_kb({"vectors": [], "chunks": [], "sources": []})
+    await update.message.reply_text("🗑️ *Knowledge Base cleared.*", parse_mode=ParseMode.MARKDOWN)
+
+
+async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["kb_mode"] = False
+    await update.message.reply_text(
+        "✅ *Finished KB upload mode.* You can now run checks or /kb_add more later.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -453,6 +565,9 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("kb_add", kb_add))
+    app.add_handler(CommandHandler("kb_clear", kb_clear))
+    app.add_handler(CommandHandler("done", done))
     # PDF documents
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
     # Text (job descriptions)
