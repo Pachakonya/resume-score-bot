@@ -1,5 +1,6 @@
 python-telegram-bot==20.6
-openai
+openai==0.28
 PyPDF2
 python-dotenv
 requests
+bs4
