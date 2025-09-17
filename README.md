@@ -2,6 +2,12 @@
 
 ResumeScoreBot helps users quickly evaluate how well their resume matches a job description. Upload a PDF resume, paste a job description (or a job URL), and get a concise, emoji-enhanced report with an ATS-style score, missing keywords, and improvement suggestions.
 
+## 🎥 Demo
+
+[![Watch the video](https://youtu.be/HzyJTzH7mRU/0.jpg)](https://youtu.be/HzyJTzH7mRU)  
+*Click the thumbnail to watch the demo.*
+
+
 ### Features
 - **PDF resume parsing**: Upload a PDF; text is extracted via `PyPDF2`.
 - **Job description input**: Paste the text or a **URL**; the bot will fetch and extract content using `requests` + `BeautifulSoup`.
